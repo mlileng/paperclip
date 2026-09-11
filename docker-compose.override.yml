@@ -2,6 +2,7 @@ services:
   db:
     restart: unless-stopped
   server:
+    image: paperclip-server:${PAPERCLIP_VERSION:-dev}
     restart: unless-stopped
     environment:
       GH_TOKEN: "${GH_TOKEN:-}"
