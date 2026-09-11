@@ -15,7 +15,6 @@ permissions:
   contents: write
   pull-requests: write
   issues: write
-  workflows: write # needed to push changes under .github/workflows (upstream adds/edits them)
 
 env:
   UPSTREAM_URL: https://github.com/paperclipai/paperclip.git
@@ -28,6 +27,10 @@ jobs:
         with:
           ref: master
           fetch-depth: 0
+          # default GITHUB_TOKEN can never push .github/workflows changes;
+          # upstream touches its own workflow files, so use a PAT with the
+          # workflow scope instead
+          token: ${{ secrets.SYNC_PAT }}
       - name: Fast-forward master from upstream
         run: |
           git remote add upstream "$UPSTREAM_URL"
@@ -43,6 +46,7 @@ jobs:
         with:
           ref: deploy
           fetch-depth: 0
+          token: ${{ secrets.SYNC_PAT }}
       - name: Attempt merge of upstream into deploy
         id: merge
         run: |
