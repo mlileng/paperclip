@@ -1,0 +1,94 @@
+name: Sync upstream
+
+# Keeps this fork current with paperclipai/paperclip:
+#   - master is fast-forwarded straight from upstream (never diverges)
+#   - deploy gets upstream merged into a throwaway branch; a clean merge
+#     opens a PR against deploy for review, a conflicting one opens an
+#     issue instead of failing silently.
+
+on:
+  schedule:
+    - cron: "0 6 * * *" # daily, 06:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+env:
+  UPSTREAM_URL: https://github.com/paperclipai/paperclip.git
+
+jobs:
+  sync-master:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+      - name: Fast-forward master from upstream
+        run: |
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch upstream master
+          git merge --ff-only upstream/master
+          git push origin master
+
+  sync-deploy:
+    needs: sync-master
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: deploy
+          fetch-depth: 0
+      - name: Attempt merge of upstream into deploy
+        id: merge
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch upstream master
+
+          if git merge-base --is-ancestor upstream/master HEAD; then
+            echo "up_to_date=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "up_to_date=false" >> "$GITHUB_OUTPUT"
+
+          BRANCH="sync/upstream-$(date +%Y%m%d)"
+          git checkout -b "$BRANCH"
+          if git merge upstream/master -m "chore: merge upstream/master into deploy"; then
+            git push origin "$BRANCH" --force-with-lease
+            echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+          else
+            git merge --abort
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Open PR for clean merge
+        if: steps.merge.outputs.up_to_date == 'false' && steps.merge.outputs.conflict == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr create \
+            --base deploy \
+            --head "${{ steps.merge.outputs.branch }}" \
+            --title "Sync upstream into deploy ($(date +%Y-%m-%d))" \
+            --body "Automated merge of \`paperclipai/paperclip@master\` into \`deploy\`. Review before merging, especially any changes to release.yml or other files this fork customizes."
+      - name: Open issue on conflict
+        if: steps.merge.outputs.conflict == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create \
+            --title "Upstream sync conflict on deploy ($(date +%Y-%m-%d))" \
+            --body "Automated merge of upstream/master into deploy hit conflicts and needs manual resolution.
+
+          \`\`\`
+          git fetch upstream
+          git checkout deploy
+          git merge upstream/master
+          # resolve conflicts
+          git push origin deploy
+          \`\`\`"
