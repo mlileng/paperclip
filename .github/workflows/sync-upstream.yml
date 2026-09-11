@@ -15,6 +15,7 @@ permissions:
   contents: write
   pull-requests: write
   issues: write
+  workflows: write # needed to push changes under .github/workflows (upstream adds/edits them)
 
 env:
   UPSTREAM_URL: https://github.com/paperclipai/paperclip.git
