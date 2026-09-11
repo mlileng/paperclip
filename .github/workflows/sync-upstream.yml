@@ -74,7 +74,10 @@ jobs:
       - name: Open PR for clean merge
         if: steps.merge.outputs.up_to_date == 'false' && steps.merge.outputs.conflict == 'false'
         env:
-          GH_TOKEN: ${{ github.token }}
+          # github.token hits "Resource not accessible by integration" for
+          # PR/issue creation on forked repos even with write perms enabled;
+          # use the real PAT instead (needs Pull requests: write too)
+          GH_TOKEN: ${{ secrets.SYNC_PAT }}
         run: |
           gh pr create \
             --base deploy \
@@ -84,7 +87,7 @@ jobs:
       - name: Open issue on conflict
         if: steps.merge.outputs.conflict == 'true'
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.SYNC_PAT }}
         run: |
           gh issue create \
             --title "Upstream sync conflict on deploy ($(date +%Y-%m-%d))" \
