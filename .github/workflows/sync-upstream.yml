@@ -74,24 +74,24 @@ jobs:
       - name: Open PR for clean merge
         if: steps.merge.outputs.up_to_date == 'false' && steps.merge.outputs.conflict == 'false'
         env:
-          # github.token hits "Resource not accessible by integration" for
-          # PR/issue creation on forked repos even with write perms enabled;
-          # use the real PAT instead (needs Pull requests: write too)
+          # gh pr create/issue create go through GraphQL, which fine-grained
+          # PATs don't support regardless of scopes ("Resource not accessible
+          # by personal access token"). Call the REST API directly instead.
           GH_TOKEN: ${{ secrets.SYNC_PAT }}
         run: |
-          gh pr create \
-            --base deploy \
-            --head "${{ steps.merge.outputs.branch }}" \
-            --title "Sync upstream into deploy ($(date +%Y-%m-%d))" \
-            --body "Automated merge of \`paperclipai/paperclip@master\` into \`deploy\`. Review before merging, especially any changes to release.yml or other files this fork customizes."
+          gh api repos/mlileng/paperclip/pulls \
+            -f title="Sync upstream into deploy ($(date +%Y-%m-%d))" \
+            -f head="${{ steps.merge.outputs.branch }}" \
+            -f base="deploy" \
+            -f body="Automated merge of \`paperclipai/paperclip@master\` into \`deploy\`. Review before merging, especially any changes to release.yml or other files this fork customizes."
       - name: Open issue on conflict
         if: steps.merge.outputs.conflict == 'true'
         env:
           GH_TOKEN: ${{ secrets.SYNC_PAT }}
         run: |
-          gh issue create \
-            --title "Upstream sync conflict on deploy ($(date +%Y-%m-%d))" \
-            --body "Automated merge of upstream/master into deploy hit conflicts and needs manual resolution.
+          gh api repos/mlileng/paperclip/issues \
+            -f title="Upstream sync conflict on deploy ($(date +%Y-%m-%d))" \
+            -f body="Automated merge of upstream/master into deploy hit conflicts and needs manual resolution.
 
           \`\`\`
           git fetch upstream
