@@ -45,6 +45,7 @@ import {
 } from "../workspace-restore-merge.js";
 import {
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
+  DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE,
   applyPaperclipWorkspaceEnv,
   asNumber,
   asString,
@@ -1967,6 +1968,17 @@ async function buildRuntime(input: {
     // are absent from tempKeysApplied and keep their compatibility protection.
     if (!scratchKeys.has(key) || value !== scratch.dir) resolvedAdapterEnv[key] = value;
   }
+  // codex-acp supports both key names, but ACP clients must select its
+  // api-key authentication method during session creation. Without this
+  // request, the server advertises authentication and rejects session/new even
+  // though the credential is present in the launched process environment.
+  if (
+    acpxAgent === "codex" &&
+    (env.OPENAI_API_KEY || env.CODEX_API_KEY) &&
+    !env.DEFAULT_AUTH_REQUEST
+  ) {
+    env.DEFAULT_AUTH_REQUEST = JSON.stringify({ methodId: "api-key" });
+  }
   if (authToken) env.PAPERCLIP_API_KEY = authToken;
   // For the claude agent, set model via ANTHROPIC_MODEL at startup rather than
   // via session/set_config_option — the ACP server's set_config_option handler
@@ -2058,7 +2070,7 @@ async function buildRuntime(input: {
     // device login wrote. This never touches `prepareCodexSkillRuntime` above
     // — that function stays Codex-only — and every other custom ACPX agent
     // (for example `kimi`) falls through this branch unaffected.
-    if (acpxAgent === "grok") {
+    if (acpxAgent === "grok" && !config.managedAiConnection) {
       env.GROK_HOME = resolveManagedGrokHomeDir(agent.companyId);
     }
     const desired = resolveLegacyPaperclipDesiredSkillNames(
@@ -2473,7 +2485,12 @@ async function buildRuntime(input: {
     await emitRunPhaseTiming(input.ctx, "start_transport", nowMs() - startTransportStart, "failed");
     throw err;
   }
-  const overrideCommand = processSessionBridge?.agentCommand ?? agentCommand;
+  // The relay runs on the host with the sanitized remote launch environment.
+  // Its /usr/bin/env node shebang cannot rely on that environment's PATH.
+  const overrideCommand = processSessionBridge?.agentCommand
+    ? [process.execPath, processSessionBridge.agentCommand]
+      .map((part) => JSON.stringify(part.replaceAll("\\", "/"))).join(" ")
+    : agentCommand;
   const overrides = overrideCommand ? { [acpxAgent]: overrideCommand } : undefined;
   const agentRegistry = createAgentRegistry({ overrides });
   const loggedEnv = buildInvocationEnvForLogs(env, {
@@ -2912,7 +2929,9 @@ async function buildPrompt(ctx: AdapterExecutionContext, resumedSession: boolean
   const hasCustomPromptTemplate = configuredPromptTemplate.trim().length > 0;
   const promptTemplate = hasCustomPromptTemplate
     ? configuredPromptTemplate
-    : DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE;
+    : context.conversationMode === true
+      ? DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE
+      : DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE;
   const instructionsFilePath = asString(config.instructionsFilePath, "").trim();
   const instructionsDir = instructionsFilePath ? `${path.dirname(instructionsFilePath)}/` : "";
   let instructionsPrefix = "";
@@ -2956,6 +2975,7 @@ async function buildPrompt(ctx: AdapterExecutionContext, resumedSession: boolean
   const externalChatTurn = isPaperclipExternalChatTurn(context.paperclipWake);
   const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, {
     resumedSession,
+    conversationMode: context.conversationMode === true,
     // The task-context markdown is the authoritative brief on this lane; keep
     // the wake prompt's description copy out so the prompt carries it once.
     suppressIssueDescription: taskContextNote.length > 0,
