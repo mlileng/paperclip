@@ -2,7 +2,9 @@ services:
   db:
     restart: unless-stopped
   server:
-    image: paperclip-server:${PAPERCLIP_VERSION:-dev}
+    # Local `start.sh --build` builds+tags this locally; docker-upgrade.sh
+    # instead `pull`s the CI-built image from GHCR for this same tag.
+    image: ghcr.io/mlileng/paperclip-server:${PAPERCLIP_VERSION:-dev}
     restart: unless-stopped
     environment:
       GH_TOKEN: "${GH_TOKEN:-}"
