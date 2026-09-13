@@ -10,6 +10,7 @@ import {
   issueThreadInteractions,
   heartbeatRuns,
   issueRecoveryActions,
+  issueComments,
   issues,
 } from "@paperclipai/db";
 import { ISSUE_DISPOSITION_REPAIR_RETRY_REASON } from "@paperclipai/shared";
@@ -544,11 +545,21 @@ export function createPostgresRunDispatchAdapter(
             .then((rows) => Boolean(rows[0]))
         : false;
 
+    const retryReasonKind = classifyRetryReasonKind(retryReason);
+    // Dependency edges can change after scheduled promotion without changing
+    // the displayed status. Read them again under the queued/final issue lock.
+    const readiness = issue && retryReasonKind === "native_safe_replacement"
+      ? (await issueService(dbOrTx).listDependencyReadiness(input.companyId, [issueId])).get(issueId)
+      : null;
     return {
       runId: input.runId,
       runAgentId: input.agentId,
       issueId,
-      retryReasonKind: classifyRetryReasonKind(retryReason),
+      retryReasonKind,
+      dependenciesBlocked: readiness && !readiness.isDependencyReady ? {
+        unresolvedBlockerIssueIds: readiness.unresolvedBlockerIssueIds,
+        unresolvedBlockerCount: readiness.unresolvedBlockerCount,
+      } : null,
       issueFound: issue !== null,
       issueStatus: issue?.status ?? null,
       issueAssigneeAgentId: issue?.assigneeAgentId ?? null,
@@ -897,7 +908,7 @@ export function createPostgresRunDispatchAdapter(
     const contextSnapshot = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(contextSnapshot.issueId);
     if (!issueId) return { issueId: null, decision: { stale: false as const } };
-    const recovery = await getExecutionBlocker(tx, run.companyId, issueId);
+    const recovery = await getExecutionBlocker(tx, run.companyId, issueId, { conversationResetCommentId: deriveCommentId(contextSnapshot) });
     if (recovery) return { issueId, decision: { stale: true as const,
       errorCode: "execution_reconciliation_required" as const, reason: recovery.nextAction,
       details: { issueId, recoveryActionId: recovery.recoveryActionId },
