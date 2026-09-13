@@ -20,9 +20,18 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # Native arm64 runner: docker-upgrade.sh runs on an Apple Silicon Mac,
+    # and this is the only deploy target today, so build for that platform
+    # directly rather than QEMU-emulating arm64 on an x86 runner (far
+    # slower for a build this heavy - Rust toolchain + a large pnpm install).
+    # Revisit with a platforms matrix if an amd64 deploy target shows up.
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
+
+      - name: Compute short SHA
+        id: sha
+        run: echo "short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -40,8 +49,9 @@ jobs:
           context: .
           file: Dockerfile
           push: true
+          # short SHA to match docker-upgrade.sh's `git rev-parse --short HEAD`
           tags: |
-            ${{ env.IMAGE }}:${{ github.sha }}
+            ${{ env.IMAGE }}:${{ steps.sha.outputs.short }}
             ${{ env.IMAGE }}:deploy-latest
           build-args: |
             PAPERCLIP_BUILD_COMMIT=${{ github.sha }}
