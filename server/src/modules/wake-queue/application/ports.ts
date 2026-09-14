@@ -110,7 +110,7 @@ export type PromoteDeferredWakeInput = {
  */
 export interface WakeQueueTransaction {
   findInvokableAgent(input: { companyId: string; agentId: string }): Promise<InvokableAgentSnapshot | null>;
-  findNextDeferredWake(input: { companyId: string; issueId: string }): Promise<DeferredWakeCandidate | null>;
+  findNextDeferredWake(input: { companyId: string; issueId: string; excludedWakeIds?: string[] }): Promise<DeferredWakeCandidate | null>;
   getQueuedCommentLiveness(input: {
     companyId: string;
     issueId: string;
@@ -428,6 +428,8 @@ export interface WakeAdmissionWriter {
       existingDeferredWakeId: string;
       mergedPayload: Record<string, unknown>;
       nextCoalescedCount: number;
+      /** A fresh manual click replaces the merged queue's execution requester. */
+      manualUserWakeActorId?: string;
       /** Persist each durable input's own receipt atomically with the merge. */
       coalescedReceipt?: CoalescedDeferredAdmissionReceipt;
     },
