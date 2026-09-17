@@ -1,3 +1,4 @@
+import { cancellableSandboxStartup } from "./startup-cancellation.js";
 import fs from "node:fs/promises";
 import fsSync from "node:fs";
 import os from "node:os";
@@ -45,6 +46,7 @@ import {
 } from "../workspace-restore-merge.js";
 import {
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
+  DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE,
   applyPaperclipWorkspaceEnv,
   asNumber,
   asString,
@@ -2058,7 +2060,7 @@ async function buildRuntime(input: {
     // device login wrote. This never touches `prepareCodexSkillRuntime` above
     // — that function stays Codex-only — and every other custom ACPX agent
     // (for example `kimi`) falls through this branch unaffected.
-    if (acpxAgent === "grok") {
+    if (acpxAgent === "grok" && !config.managedAiConnection) {
       env.GROK_HOME = resolveManagedGrokHomeDir(agent.companyId);
     }
     const desired = resolveLegacyPaperclipDesiredSkillNames(
@@ -2473,7 +2475,12 @@ async function buildRuntime(input: {
     await emitRunPhaseTiming(input.ctx, "start_transport", nowMs() - startTransportStart, "failed");
     throw err;
   }
-  const overrideCommand = processSessionBridge?.agentCommand ?? agentCommand;
+  // The relay runs on the host with the sanitized remote launch environment.
+  // Its /usr/bin/env node shebang cannot rely on that environment's PATH.
+  const overrideCommand = processSessionBridge?.agentCommand
+    ? [process.execPath, processSessionBridge.agentCommand]
+      .map((part) => JSON.stringify(part.replaceAll("\\", "/"))).join(" ")
+    : agentCommand;
   const overrides = overrideCommand ? { [acpxAgent]: overrideCommand } : undefined;
   const agentRegistry = createAgentRegistry({ overrides });
   const loggedEnv = buildInvocationEnvForLogs(env, {
@@ -2618,11 +2625,25 @@ function resolveRuntimeEnv(
     env,
     (options.platform ?? process.platform) === "win32",
   );
-  return Object.fromEntries(
+  const finalEnv = Object.fromEntries(
     Object.entries(mergedEnv).filter(
       (entry): entry is [string, string] => typeof entry[1] === "string",
     ),
   );
+  // codex-acp supports both key names, but ACP clients must select its
+  // api-key authentication method during session creation. Without this
+  // request, the server advertises authentication and rejects session/new even
+  // though the credential is present in the launched process environment. Check
+  // the final merged environment, not just the explicit run config, so a host
+  // key the local launch inherits still selects this default.
+  if (
+    acpxAgent === "codex" &&
+    (finalEnv.OPENAI_API_KEY || finalEnv.CODEX_API_KEY) &&
+    !finalEnv.DEFAULT_AUTH_REQUEST
+  ) {
+    finalEnv.DEFAULT_AUTH_REQUEST = JSON.stringify({ methodId: "api-key" });
+  }
+  return finalEnv;
 }
 
 function mergeRuntimeEnvironment(
@@ -2912,7 +2933,9 @@ async function buildPrompt(ctx: AdapterExecutionContext, resumedSession: boolean
   const hasCustomPromptTemplate = configuredPromptTemplate.trim().length > 0;
   const promptTemplate = hasCustomPromptTemplate
     ? configuredPromptTemplate
-    : DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE;
+    : context.conversationMode === true
+      ? DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE
+      : DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE;
   const instructionsFilePath = asString(config.instructionsFilePath, "").trim();
   const instructionsDir = instructionsFilePath ? `${path.dirname(instructionsFilePath)}/` : "";
   let instructionsPrefix = "";
@@ -2956,6 +2979,7 @@ async function buildPrompt(ctx: AdapterExecutionContext, resumedSession: boolean
   const externalChatTurn = isPaperclipExternalChatTurn(context.paperclipWake);
   const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, {
     resumedSession,
+    conversationMode: context.conversationMode === true,
     // The task-context markdown is the authoritative brief on this lane; keep
     // the wake prompt's description copy out so the prompt carries it once.
     suppressIssueDescription: taskContextNote.length > 0,
@@ -4095,23 +4119,28 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         // run inside this wrap and overrides the store, so an in-step exec still
         // parents to its step span. On a local or SSH target
         // `spanParent.parentContext` is a no-op token, so the wrap is inert.
-        prepared = await runWithRuntimeParent(spanParent.parentContext, () =>
-          buildRuntime({
-            ctx,
-            engine,
-            deps,
-            ledger: runResourceLedger,
-            stagedIdleMs: warmIdleMs,
-            spanParent,
-            getRuntimeParentContext,
-            runtimeSpan: runRuntimeSpan,
-            stageRuntimeSpan: runStageSpan,
-          }),
-        );
-        buildRuntimeSettled = true;
-        // Capture the run's staging lease release now that the runtime built. The
-        // run root `finally` releases it as the final settlement act.
-        releaseStagingLease = prepared.sessionStagingLeaseRelease;
+        const startupCancellation = cancellableSandboxStartup(ctx);
+        try {
+          prepared = await runWithRuntimeParent(spanParent.parentContext, () =>
+            buildRuntime({
+              ctx: startupCancellation.context,
+              engine,
+              deps,
+              ledger: runResourceLedger,
+              stagedIdleMs: warmIdleMs,
+              spanParent,
+              getRuntimeParentContext,
+              runtimeSpan: runRuntimeSpan,
+              stageRuntimeSpan: runStageSpan,
+            }),
+          );
+          buildRuntimeSettled = true;
+          // Capture acquired resources before the cancellation boundary so the
+          // normal settlement path also releases a just-completed build.
+          releaseStagingLease = prepared.sessionStagingLeaseRelease;
+        } finally {
+          await startupCancellation.finish();
+        }
         // Per-project staging outcomes for the referenced (mentioned) projects, surfaced back to the
         // server on the run result. A referenced project that failed to stage into the sandbox is a
         // first-class, counted failure in the requested-vs-synced observability, not only a warning. The
