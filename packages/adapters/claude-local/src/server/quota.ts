@@ -271,7 +271,102 @@ export async function fetchWithTimeout(url: string, init: RequestInit, ms = 8000
   }
 }
 
-export async function fetchClaudeQuota(token: string): Promise<QuotaWindow[]> {
+interface QuotaThrottleEntry {
+  lastFetchTime: number;
+  cachedWindows: QuotaWindow[] | null;
+  cacheTimestamp: number | null;
+  consecutiveRateLimits: number;
+  backoffUntil: number | null;
+}
+
+// Keyed by token: different local logins (different users, different
+// loginHome dirs) hold different tokens and must never share cached usage
+// data or a backoff window — that would leak one user's verification result
+// to another and let an unverified token ride through on a cache hit.
+const quotaThrottleByToken = new Map<string, QuotaThrottleEntry>();
+const QUOTA_THROTTLE_MAX_ENTRIES = 200;
+
+function getThrottleEntry(token: string): QuotaThrottleEntry {
+  let entry = quotaThrottleByToken.get(token);
+  if (!entry) {
+    entry = { lastFetchTime: 0, cachedWindows: null, cacheTimestamp: null, consecutiveRateLimits: 0, backoffUntil: null };
+    if (quotaThrottleByToken.size >= QUOTA_THROTTLE_MAX_ENTRIES) {
+      const oldestKey = quotaThrottleByToken.keys().next().value;
+      if (oldestKey !== undefined) quotaThrottleByToken.delete(oldestKey);
+    }
+    quotaThrottleByToken.set(token, entry);
+  }
+  return entry;
+}
+
+/** Test-only: clear all cached throttle state between test cases. */
+export function resetClaudeQuotaThrottleForTests(): void {
+  quotaThrottleByToken.clear();
+}
+
+const QUOTA_MIN_FETCH_INTERVAL_MS = 60_000;
+const QUOTA_CACHE_TTL_MS = 5 * 60_000;
+const QUOTA_BACKOFF_BASE_MS = 60_000;
+const QUOTA_BACKOFF_MAX_MS = 15 * 60_000;
+const QUOTA_BACKOFF_JITTER_MS = 5_000;
+
+function getExponentialBackoffMs(consecutiveRateLimits: number): number {
+  const baseBackoff = Math.min(
+    QUOTA_BACKOFF_BASE_MS * Math.pow(2, Math.max(0, consecutiveRateLimits - 1)),
+    QUOTA_BACKOFF_MAX_MS,
+  );
+  const jitter = Math.random() * QUOTA_BACKOFF_JITTER_MS;
+  return baseBackoff + jitter;
+}
+
+/** Anthropic rate-limits /api/oauth/usage; without throttling, a single 429
+ * poisons every subsequent poll even though the last-known usage is still
+ * fresh. Throttle live fetches to 1/min per token, serve a 5-min-old cache
+ * while backing off, and back off exponentially (60s -> 15min, + jitter) on
+ * 429s. State is scoped per-token so one user's quota check can never read
+ * or block on another user's cache/backoff. */
+async function fetchClaudeQuotaWithBackoff(token: string): Promise<QuotaWindow[]> {
+  const now = Date.now();
+  const entry = getThrottleEntry(token);
+
+  if (entry.backoffUntil && now < entry.backoffUntil) {
+    if (entry.cachedWindows && entry.cacheTimestamp) {
+      return entry.cachedWindows;
+    }
+    throw new Error(
+      `anthropic usage api rate limited; backed off until ${new Date(entry.backoffUntil).toISOString()}`,
+    );
+  }
+
+  const timeSinceLastFetch = now - entry.lastFetchTime;
+  if (timeSinceLastFetch < QUOTA_MIN_FETCH_INTERVAL_MS && entry.cachedWindows) {
+    return entry.cachedWindows;
+  }
+
+  const cacheAge = entry.cacheTimestamp ? now - entry.cacheTimestamp : Infinity;
+  try {
+    const windows = await fetchClaudeQuotaDirect(token);
+    entry.lastFetchTime = now;
+    entry.cachedWindows = windows;
+    entry.cacheTimestamp = now;
+    entry.consecutiveRateLimits = 0;
+    entry.backoffUntil = null;
+    return windows;
+  } catch (error) {
+    const isRateLimit = error instanceof Error && error.message.includes("anthropic usage api returned 429");
+    if (isRateLimit) {
+      entry.consecutiveRateLimits++;
+      entry.backoffUntil = now + getExponentialBackoffMs(entry.consecutiveRateLimits);
+    }
+
+    if (entry.cachedWindows && cacheAge < QUOTA_CACHE_TTL_MS) {
+      return entry.cachedWindows;
+    }
+    throw error;
+  }
+}
+
+async function fetchClaudeQuotaDirect(token: string): Promise<QuotaWindow[]> {
   const resp = await fetchWithTimeout("https://api.anthropic.com/api/oauth/usage", {
     headers: {
       Authorization: `Bearer ${token}`,
@@ -334,6 +429,10 @@ export async function fetchClaudeQuota(token: string): Promise<QuotaWindow[]> {
     });
   }
   return windows;
+}
+
+export async function fetchClaudeQuota(token: string): Promise<QuotaWindow[]> {
+  return fetchClaudeQuotaWithBackoff(token);
 }
 
 function usageOutputLooksRelevant(text: string): boolean {
