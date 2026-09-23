@@ -364,7 +364,12 @@ async function fetchClaudeQuotaWithBackoff(token: string): Promise<QuotaWindow[]
   }
 
   const timeSinceLastFetch = now - entry.lastFetchTime;
-  if (timeSinceLastFetch < QUOTA_MIN_FETCH_INTERVAL_MS && entry.cachedWindows) {
+  if (
+    timeSinceLastFetch < QUOTA_MIN_FETCH_INTERVAL_MS
+    && entry.cachedWindows
+    && entry.cacheTimestamp
+    && now - entry.cacheTimestamp < QUOTA_CACHE_TTL_MS
+  ) {
     return entry.cachedWindows;
   }
 
