@@ -277,6 +277,24 @@ interface QuotaThrottleEntry {
   cacheTimestamp: number | null;
   consecutiveRateLimits: number;
   backoffUntil: number | null;
+  inFlight: Promise<QuotaWindow[]> | null;
+}
+
+class AnthropicUsageApiError extends Error {
+  constructor(readonly status: number, readonly retryAfterMs: number | undefined) {
+    super(`anthropic usage api returned ${status}`);
+  }
+}
+
+/** Parses a `Retry-After` header into milliseconds, defensively — only when
+ * present and a non-negative number of seconds. The HTTP-date form is
+ * intentionally not parsed. */
+function parseRetryAfterMs(headers?: { get?(name: string): string | null }): number | undefined {
+  const raw = headers?.get?.("retry-after");
+  if (!raw) return undefined;
+  const seconds = Number(raw);
+  if (!Number.isFinite(seconds) || seconds < 0) return undefined;
+  return Math.round(seconds * 1000);
 }
 
 // Keyed by token: different local logins (different users, different
@@ -289,7 +307,14 @@ const QUOTA_THROTTLE_MAX_ENTRIES = 200;
 function getThrottleEntry(token: string): QuotaThrottleEntry {
   let entry = quotaThrottleByToken.get(token);
   if (!entry) {
-    entry = { lastFetchTime: 0, cachedWindows: null, cacheTimestamp: null, consecutiveRateLimits: 0, backoffUntil: null };
+    entry = {
+      lastFetchTime: 0,
+      cachedWindows: null,
+      cacheTimestamp: null,
+      consecutiveRateLimits: 0,
+      backoffUntil: null,
+      inFlight: null,
+    };
     if (quotaThrottleByToken.size >= QUOTA_THROTTLE_MAX_ENTRIES) {
       const oldestKey = quotaThrottleByToken.keys().next().value;
       if (oldestKey !== undefined) quotaThrottleByToken.delete(oldestKey);
@@ -330,7 +355,7 @@ async function fetchClaudeQuotaWithBackoff(token: string): Promise<QuotaWindow[]
   const entry = getThrottleEntry(token);
 
   if (entry.backoffUntil && now < entry.backoffUntil) {
-    if (entry.cachedWindows && entry.cacheTimestamp) {
+    if (entry.cachedWindows && entry.cacheTimestamp && now - entry.cacheTimestamp < QUOTA_CACHE_TTL_MS) {
       return entry.cachedWindows;
     }
     throw new Error(
@@ -343,27 +368,45 @@ async function fetchClaudeQuotaWithBackoff(token: string): Promise<QuotaWindow[]
     return entry.cachedWindows;
   }
 
-  const cacheAge = entry.cacheTimestamp ? now - entry.cacheTimestamp : Infinity;
-  try {
-    const windows = await fetchClaudeQuotaDirect(token);
-    entry.lastFetchTime = now;
-    entry.cachedWindows = windows;
-    entry.cacheTimestamp = now;
-    entry.consecutiveRateLimits = 0;
-    entry.backoffUntil = null;
-    return windows;
-  } catch (error) {
-    const isRateLimit = error instanceof Error && error.message.includes("anthropic usage api returned 429");
-    if (isRateLimit) {
-      entry.consecutiveRateLimits++;
-      entry.backoffUntil = now + getExponentialBackoffMs(entry.consecutiveRateLimits);
-    }
+  // Reuse an in-flight request for this token rather than starting a second
+  // one: lastFetchTime alone isn't atomic across concurrent callers (e.g. a
+  // poll and a connection check overlapping), so without sharing the promise
+  // both would pass the throttle above and double-hit Anthropic.
+  if (entry.inFlight) return entry.inFlight;
 
-    if (entry.cachedWindows && cacheAge < QUOTA_CACHE_TTL_MS) {
-      return entry.cachedWindows;
-    }
-    throw error;
-  }
+  const cacheAge = entry.cacheTimestamp ? now - entry.cacheTimestamp : Infinity;
+  entry.lastFetchTime = now;
+  const fetchPromise = fetchClaudeQuotaDirect(token)
+    .then((windows) => {
+      entry.cachedWindows = windows;
+      entry.cacheTimestamp = Date.now();
+      entry.consecutiveRateLimits = 0;
+      entry.backoffUntil = null;
+      return windows;
+    })
+    .catch((error: unknown) => {
+      if (error instanceof AnthropicUsageApiError && error.status === 429) {
+        entry.consecutiveRateLimits++;
+        entry.backoffUntil = now + (error.retryAfterMs ?? getExponentialBackoffMs(entry.consecutiveRateLimits));
+
+        if (entry.cachedWindows && cacheAge < QUOTA_CACHE_TTL_MS) {
+          return entry.cachedWindows;
+        }
+        throw new Error(
+          `anthropic usage api rate limited; backed off until ${new Date(entry.backoffUntil).toISOString()}`,
+        );
+      }
+
+      if (entry.cachedWindows && cacheAge < QUOTA_CACHE_TTL_MS) {
+        return entry.cachedWindows;
+      }
+      throw error;
+    })
+    .finally(() => {
+      entry.inFlight = null;
+    });
+  entry.inFlight = fetchPromise;
+  return fetchPromise;
 }
 
 async function fetchClaudeQuotaDirect(token: string): Promise<QuotaWindow[]> {
@@ -373,7 +416,7 @@ async function fetchClaudeQuotaDirect(token: string): Promise<QuotaWindow[]> {
       "anthropic-beta": "oauth-2025-04-20",
     },
   });
-  if (!resp.ok) throw new Error(`anthropic usage api returned ${resp.status}`);
+  if (!resp.ok) throw new AnthropicUsageApiError(resp.status, parseRetryAfterMs(resp.headers));
   const body = (await resp.json()) as AnthropicUsageResponse;
   const windows: QuotaWindow[] = [];
 
